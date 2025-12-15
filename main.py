@@ -13,22 +13,18 @@ from typing import Dict, List, Optional
 
 BOT_TOKEN = "8497365873:AAEbquvUEc79JmTtuJHqHGu_Rm0Uzi5A1-s"
 ADMIN_ID = 7694543415
-CHANNEL_ID = -1001234567890
-CHANNEL_USERNAME = "DarkDalsho"
+CHANNEL_USERNAME = "LogovoDextera"
 BOT_NAME = "DexterFreeVpn"
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Параметры системы
 FREE_VPN_COOLDOWN_DAYS = 21  # 3 недели
-VPN_PER_DAY = [1, 2]  # 1-2 ссылки в день для раздачи
 
-# Тарифы премиума (для обхода кулдауна)
+# Тарифы (только 3)
 TARIFFS = {
-    "7days": {"price": 30, "duration_days": 7, "name": "7 дней"},
-    "30days": {"price": 50, "duration_days": 30, "name": "30 дней"},
-    "90days": {"price": 120, "duration_days": 90, "name": "90 дней"},
-    "180days": {"price": 200, "duration_days": 180, "name": "180 дней"},
-    "365days": {"price": 300, "duration_days": 365, "name": "1 год"}
+    "month": {"price": 50, "duration_days": 30, "name": "📅 Месяц"},
+    "year": {"price": 150, "duration_days": 365, "name": "🗓 Год"},
+    "5years": {"price": 250, "duration_days": 1825, "name": "🎯 5 лет"}
 }
 
 # ============================================================================
@@ -57,6 +53,8 @@ class Database:
                 first_name TEXT,
                 last_name TEXT,
                 joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                referrer_id INTEGER,
+                referral_code TEXT UNIQUE,
                 last_free_vpn_date TIMESTAMP,
                 premium_until TIMESTAMP,
                 is_subscribed BOOLEAN DEFAULT 0,
@@ -70,15 +68,14 @@ class Database:
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS vpn_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                link TEXT NOT NULL,
+                link TEXT NOT NULL UNIQUE,
                 added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 is_active BOOLEAN DEFAULT 1,
-                given_count INTEGER DEFAULT 0,
-                expiry_date TIMESTAMP
+                given_count INTEGER DEFAULT 0
             )
         ''')
 
-        # Таблица истории получения VPN
+        # История получения VPN
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS vpn_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,7 +86,44 @@ class Database:
             )
         ''')
 
-        # Таблица покупок
+        # Реферальная система
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER NOT NULL,
+                referred_user_id INTEGER NOT NULL UNIQUE,
+                referred_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                bonus_applied BOOLEAN DEFAULT 0,
+                FOREIGN KEY(referrer_id) REFERENCES users(user_id),
+                FOREIGN KEY(referred_user_id) REFERENCES users(user_id)
+            )
+        ''')
+
+        # Промокоды
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                usage_limit INTEGER,
+                usage_count INTEGER DEFAULT 0,
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1
+            )
+        ''')
+
+        # Использованные промокоды пользователями
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS promo_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                promo_code TEXT NOT NULL,
+                used_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, promo_code),
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+
+        # Покупки
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS purchases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +136,7 @@ class Database:
             )
         ''')
 
-        # Логи админа
+        # Логи
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS admin_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,13 +225,28 @@ class TelegramAPI:
 # КЛАВИАТУРЫ
 # ============================================================================
 
-def get_main_keyboard():
-    return {
+def get_main_keyboard(is_admin=False):
+    keyboard = {
         "inline_keyboard": [
             [{"text": "📥 Получить VPN", "callback_data": "get_vpn"}],
             [{"text": "💳 Купить доступ", "callback_data": "buy_vpn"}],
-            [{"text": "⚙️ Профиль", "callback_data": "profile"}],
-            [{"text": "📢 Свежие VPN", "callback_data": "latest_vpn"}]
+            [{"text": "👤 Профиль", "callback_data": "profile"}],
+            [{"text": "📊 Статистика", "callback_data": "statistics"}],
+            [{"text": "🏆 Топ рефералов", "callback_data": "top_referrals"}]
+        ]
+    }
+    
+    if is_admin:
+        keyboard["inline_keyboard"].insert(0, [{"text": "⚙️ Админ-панель", "callback_data": "admin"}])
+    
+    return keyboard
+
+def get_profile_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "🔗 Реферальная система", "callback_data": "referral_system"}],
+            [{"text": "🎁 Ввести промокод", "callback_data": "enter_promo"}],
+            [{"text": "⬅️ Назад", "callback_data": "back_main"}]
         ]
     }
 
@@ -216,9 +265,10 @@ def get_buy_keyboard():
 def get_admin_keyboard():
     return {
         "inline_keyboard": [
-            [{"text": "📥 Загрузить VPN ссылки", "callback_data": "admin_add_vpn"}],
+            [{"text": "📥 Загрузить VPN", "callback_data": "admin_add_vpn"}],
             [{"text": "📋 Список VPN", "callback_data": "admin_list_vpn"}],
-            [{"text": "📊 Статистика", "callback_data": "admin_stats"}],
+            [{"text": "🎁 Промокоды", "callback_data": "admin_promo"}],
+            [{"text": "📊 Админ статистика", "callback_data": "admin_stats"}],
             [{"text": "📢 Рассылка", "callback_data": "admin_broadcast"}],
             [{"text": "⬅️ Назад", "callback_data": "back_main"}]
         ]
@@ -228,13 +278,24 @@ def get_admin_keyboard():
 # ПОЛЬЗОВАТЕЛЬСКИЕ ФУНКЦИИ
 # ============================================================================
 
+def generate_referral_code(user_id: int, length: int = 8):
+    chars = string.ascii_letters + string.digits
+    code = ''.join(random.choices(chars, k=length))
+    
+    existing = db.fetch_one("SELECT * FROM users WHERE referral_code = ?", (code,))
+    if existing:
+        return generate_referral_code(user_id, length)
+    
+    return code
+
 def get_or_create_user(user_id: int, username: str = "", first_name: str = "", last_name: str = ""):
     user = db.fetch_one("SELECT * FROM users WHERE user_id = ?", (user_id,))
     
     if not user:
+        referral_code = generate_referral_code(user_id)
         db.execute(
-            "INSERT INTO users (user_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
-            (user_id, username, first_name, last_name)
+            "INSERT INTO users (user_id, username, first_name, last_name, referral_code) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, first_name, last_name, referral_code)
         )
         return db.fetch_one("SELECT * FROM users WHERE user_id = ?", (user_id,))
     
@@ -252,22 +313,61 @@ def check_subscription(user_id: int):
     except:
         return False
 
+def add_referral(referrer_id: int, referred_user_id: int):
+    # Проверка что не добавлен
+    existing = db.fetch_one(
+        "SELECT * FROM referrals WHERE referred_user_id = ?",
+        (referred_user_id,)
+    )
+    
+    if existing or referrer_id == referred_user_id:
+        return False
+    
+    # Добавить
+    db.execute(
+        "INSERT INTO referrals (referrer_id, referred_user_id, bonus_applied) VALUES (?, ?, 1)",
+        (referrer_id, referred_user_id)
+    )
+    
+    # Уменьшить кулдаун реферреру на 1 день
+    referrer = db.fetch_one("SELECT * FROM users WHERE user_id = ?", (referrer_id,))
+    
+    if referrer['last_free_vpn_date']:
+        last_date = datetime.fromisoformat(referrer['last_free_vpn_date'])
+        # Минус 1 день от последней даты (то есть раньше сможет получить)
+        new_date = last_date - timedelta(days=1)
+        db.execute(
+            "UPDATE users SET last_free_vpn_date = ? WHERE user_id = ?",
+            (new_date.isoformat(), referrer_id)
+        )
+    
+    # Уведомление
+    if referrer['notifications_enabled']:
+        notify_text = f"""🎉 <b>Новый реферал!</b>
+
+Пользователь присоединился по вашей ссылке!
+✅ Ваш кулдаун уменьшен на 1 день.
+        """
+        TelegramAPI.send_message(referrer_id, notify_text.strip())
+    
+    return True
+
 def get_user_profile_text(user_id: int):
     user = db.fetch_one("SELECT * FROM users WHERE user_id = ?", (user_id,))
     
     if not user:
         return "Пользователь не найден"
     
-    # Проверка премиума
+    # Премиум статус
     premium_status = "❌ Нет"
     if user['premium_until']:
         premium_date = datetime.fromisoformat(user['premium_until'])
         if premium_date > datetime.now():
             premium_status = f"✅ До {premium_date.strftime('%d.%m.%Y')}"
         else:
-            premium_status = "❌ Истек"
+            premium_status = "❌ Истёк"
     
-    # Проверка кулдауна
+    # Кулдаун
     if user['last_free_vpn_date']:
         last_vpn_date = datetime.fromisoformat(user['last_free_vpn_date'])
         next_vpn_date = last_vpn_date + timedelta(days=FREE_VPN_COOLDOWN_DAYS)
@@ -275,25 +375,159 @@ def get_user_profile_text(user_id: int):
         if next_vpn_date > datetime.now():
             days_left = (next_vpn_date - datetime.now()).days
             hours_left = ((next_vpn_date - datetime.now()).seconds // 3600)
-            days_left_text = f"⏳ {days_left} д {hours_left} ч"
+            cooldown_text = f"⏳ {days_left} д {hours_left} ч"
         else:
-            days_left_text = "✅ Доступно"
+            cooldown_text = "✅ Доступно"
     else:
-        days_left_text = "✅ Доступно"
+        cooldown_text = "✅ Доступно"
+    
+    # Рефералы
+    referral_count = db.fetch_one(
+        "SELECT COUNT(*) as count FROM referrals WHERE referrer_id = ?",
+        (user_id,)
+    )['count']
     
     text = f"""
 <b>👤 Ваш профиль</b>
 
 <b>ID:</b> {user['user_id']}
 <b>Имя:</b> {user['first_name']} {user['last_name'] or ''}
-<b>Юзернейм:</b> @{user['username']}
+<b>Username:</b> @{user['username'] or 'не указан'}
 
 <b>📊 Статистика:</b>
 • <b>Присоединился:</b> {datetime.fromisoformat(user['joined_date']).strftime('%d.%m.%Y')}
-• <b>Премиум статус:</b> {premium_status}
-• <b>Бесплатный VPN:</b> {days_left_text}
+• <b>Премиум:</b> {premium_status}
+• <b>Бесплатный VPN:</b> {cooldown_text}
+• <b>Рефералов привлечено:</b> {referral_count}
+
+<b>🔗 Реферальный код:</b> <code>{user['referral_code']}</code>
     """
     return text.strip()
+
+def get_statistics_text():
+    total_users = db.fetch_one("SELECT COUNT(*) as count FROM users")['count']
+    total_vpns = db.fetch_one("SELECT COUNT(*) as count FROM vpn_links WHERE is_active = 1")['count']
+    
+    # Выдано всего
+    total_given = db.fetch_one(
+        "SELECT SUM(given_count) as total FROM vpn_links"
+    )['total'] or 0
+    
+    # За сегодня
+    today_given = db.fetch_one(
+        "SELECT COUNT(*) as count FROM vpn_history WHERE date(received_date) = date('now')"
+    )['count']
+    
+    # За месяц
+    month_given = db.fetch_one(
+        "SELECT COUNT(*) as count FROM vpn_history WHERE date(received_date) >= date('now', '-30 days')"
+    )['count']
+    
+    text = f"""
+<b>📊 Статистика бота</b>
+
+<b>👥 Пользователи:</b>
+• Всего: {total_users}
+
+<b>🔗 VPN:</b>
+• Всего выдано: {total_given}
+• Доступно сейчас: {total_vpns}
+• Выдано за сегодня: {today_given}
+• Выдано за месяц: {month_given}
+    """
+    return text.strip()
+
+def get_top_referrals_text():
+    top = db.fetch_all("""
+        SELECT users.user_id, users.first_name, users.username, COUNT(referrals.id) as ref_count
+        FROM users
+        LEFT JOIN referrals ON users.user_id = referrals.referrer_id
+        GROUP BY users.user_id
+        HAVING ref_count > 0
+        ORDER BY ref_count DESC
+        LIMIT 10
+    """)
+    
+    if not top:
+        return "<b>🏆 Топ рефералов</b>\n\nПока никто не привлёк рефералов."
+    
+    text = "<b>🏆 Топ 10 рефералов</b>\n\n"
+    for i, user in enumerate(top, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        name = user['first_name']
+        username = f"@{user['username']}" if user['username'] else ""
+        text += f"{medal} {name} {username} - <b>{user['ref_count']}</b> реф.\n"
+    
+    return text.strip()
+
+# ============================================================================
+# ПРОМОКОДЫ
+# ============================================================================
+
+def generate_promo_code(length: int = 8):
+    chars = string.ascii_uppercase + string.digits
+    code = ''.join(random.choices(chars, k=length))
+    
+    existing = db.fetch_one("SELECT * FROM promo_codes WHERE code = ?", (code,))
+    if existing:
+        return generate_promo_code(length)
+    
+    return code
+
+def create_promo_codes(count: int, usage_limit: int = None):
+    codes = []
+    for _ in range(count):
+        code = generate_promo_code()
+        db.execute(
+            "INSERT INTO promo_codes (code, usage_limit) VALUES (?, ?)",
+            (code, usage_limit)
+        )
+        codes.append(code)
+    
+    return codes
+
+def use_promo_code(user_id: int, code: str):
+    # Проверить промокод
+    promo = db.fetch_one(
+        "SELECT * FROM promo_codes WHERE code = ? AND is_active = 1",
+        (code.upper(),)
+    )
+    
+    if not promo:
+        return False, "❌ Промокод не найден или неактивен."
+    
+    # Проверить лимит
+    if promo['usage_limit'] and promo['usage_count'] >= promo['usage_limit']:
+        return False, "❌ Промокод использован максимальное количество раз."
+    
+    # Проверить использовал ли пользователь
+    used = db.fetch_one(
+        "SELECT * FROM promo_usage WHERE user_id = ? AND promo_code = ?",
+        (user_id, code.upper())
+    )
+    
+    if used:
+        return False, "❌ Вы уже использовали этот промокод."
+    
+    # Применить - обнулить кулдаун
+    db.execute(
+        "UPDATE users SET last_free_vpn_date = NULL WHERE user_id = ?",
+        (user_id,)
+    )
+    
+    # Отметить использование
+    db.execute(
+        "INSERT INTO promo_usage (user_id, promo_code) VALUES (?, ?)",
+        (user_id, code.upper())
+    )
+    
+    # Обновить счетчик
+    db.execute(
+        "UPDATE promo_codes SET usage_count = usage_count + 1 WHERE code = ?",
+        (code.upper(),)
+    )
+    
+    return True, "✅ Промокод применён! Кулдаун обнулён."
 
 # ============================================================================
 # ОБРАБОТЧИКИ КОМАНД
@@ -305,25 +539,56 @@ def handle_start_command(message: dict):
     first_name = message['from'].get('first_name', '')
     last_name = message['from'].get('last_name', '')
     
-    get_or_create_user(user_id, username, first_name, last_name)
+    # Проверка реферального кода
+    args = message.get('text', '').split()
+    
+    user = get_or_create_user(user_id, username, first_name, last_name)
+    
+    if len(args) > 1:
+        ref_code = args[1]
+        referrer = db.fetch_one(
+            "SELECT * FROM users WHERE referral_code = ?",
+            (ref_code,)
+        )
+        
+        if referrer and referrer['user_id'] != user_id:
+            # Проверить не добавлен ли уже
+            already = db.fetch_one(
+                "SELECT * FROM users WHERE user_id = ? AND referrer_id IS NOT NULL",
+                (user_id,)
+            )
+            
+            if not already:
+                db.execute(
+                    "UPDATE users SET referrer_id = ? WHERE user_id = ?",
+                    (referrer['user_id'], user_id)
+                )
+                add_referral(referrer['user_id'], user_id)
+    
+    is_admin = user_id == ADMIN_ID
     
     welcome_text = f"""
 <b>🎉 Добро пожаловать в {BOT_NAME}!</b>
 
-Это бот для раздачи бесплатных VPN ссылок!
+Это бот для раздачи бесплатных VPN!
 
 <b>📋 Возможности:</b>
-✅ Получайте бесплатные VPN ссылки (1 раз в 3 недели)
-✅ Купите премиум для дополнительных VPN
-✅ Следите за статистикой в профиле
-✅ Получайте уведомления о новых VPN
+✅ Получайте бесплатные VPN (1 раз в 3 недели)
+✅ Приглашайте друзей - уменьшайте кулдаун
+✅ Используйте промокоды для обнуления кулдауна
+✅ Покупайте премиум для безлимитного доступа
+✅ Смотрите статистику и топ рефералов
 
 <b>📢 Подпишитесь на канал:</b> @{CHANNEL_USERNAME}
 
 Выберите действие ниже:
     """
     
-    TelegramAPI.send_message(user_id, welcome_text.strip(), reply_markup=get_main_keyboard())
+    TelegramAPI.send_message(
+        user_id,
+        welcome_text.strip(),
+        reply_markup=get_main_keyboard(is_admin)
+    )
 
 def handle_callback_query(callback_query: dict):
     user_id = callback_query['from']['id']
@@ -338,8 +603,8 @@ def handle_callback_query(callback_query: dict):
     if callback_data == "back_main":
         TelegramAPI.edit_message(
             chat_id, message_id,
-            "📱 <b>Главное меню</b>",
-            reply_markup=get_main_keyboard()
+            "📱 <b>Главное меню</b>\n\nВыберите действие:",
+            reply_markup=get_main_keyboard(is_admin)
         )
     
     # ========== ПОЛУЧИТЬ VPN ==========
@@ -356,8 +621,14 @@ def handle_callback_query(callback_query: dict):
             )
             return
         
+        # Проверка премиума
+        has_premium = False
+        if user['premium_until']:
+            premium_date = datetime.fromisoformat(user['premium_until'])
+            has_premium = premium_date > datetime.now()
+        
         # Проверка кулдауна (если нет премиума)
-        if not user['premium_until'] or datetime.fromisoformat(user['premium_until']) < datetime.now():
+        if not has_premium:
             if user['last_free_vpn_date']:
                 last_vpn_date = datetime.fromisoformat(user['last_free_vpn_date'])
                 next_vpn_date = last_vpn_date + timedelta(days=FREE_VPN_COOLDOWN_DAYS)
@@ -367,14 +638,15 @@ def handle_callback_query(callback_query: dict):
                     hours_left = ((next_vpn_date - datetime.now()).seconds // 3600)
                     
                     cooldown_text = f"""
-<b>⏳ Кулдаун VPN</b>
+<b>⏳ Кулдаун активен</b>
 
 До следующего бесплатного VPN осталось:
 <b>{days_left} дней {hours_left} часов</b>
 
-💡 <b>Опции:</b>
-• Подождите до указанного времени
-• Купите доступ в "Купить доступ"
+<b>💡 Хотите получить раньше?</b>
+• Пригласите друзей (-1 день за каждого)
+• Используйте промокод (обнуление кулдауна)
+• Купите премиум доступ
                     """
                     
                     TelegramAPI.edit_message(
@@ -383,6 +655,7 @@ def handle_callback_query(callback_query: dict):
                         reply_markup={
                             "inline_keyboard": [
                                 [{"text": "💳 Купить доступ", "callback_data": "buy_vpn"}],
+                                [{"text": "🎁 Ввести промокод", "callback_data": "enter_promo"}],
                                 [{"text": "⬅️ Назад", "callback_data": "back_main"}]
                             ]
                         }
@@ -402,11 +675,12 @@ def handle_callback_query(callback_query: dict):
             )
             return
         
-        # Обновить дату последнего получения
-        db.execute(
-            "UPDATE users SET last_free_vpn_date = ? WHERE user_id = ?",
-            (datetime.now().isoformat(), user_id)
-        )
+        # Обновить дату
+        if not has_premium:
+            db.execute(
+                "UPDATE users SET last_free_vpn_date = ? WHERE user_id = ?",
+                (datetime.now().isoformat(), user_id)
+            )
         
         # Добавить в историю
         db.execute(
@@ -421,7 +695,7 @@ def handle_callback_query(callback_query: dict):
         )
         
         vpn_text = f"""
-<b>✅ Вот ваша VPN ссылка!</b>
+<b>✅ Ваша VPN ссылка!</b>
 
 <code>{vpn_link['link']}</code>
 
@@ -431,7 +705,8 @@ def handle_callback_query(callback_query: dict):
 3. Импортируйте конфиг
 4. Подключитесь!
 
-⏰ Следующую ссылку сможете получить через 3 недели.
+⏰ Следующая ссылка через 3 недели.
+💡 Пригласите друзей - получайте раньше!
         """
         
         TelegramAPI.edit_message(
@@ -470,13 +745,13 @@ def handle_callback_query(callback_query: dict):
 <b>Цена:</b> {tariff_info['price']} руб
 <b>Действителен:</b> {tariff_info['duration_days']} дней
 
-📝 <b>Способ оплаты:</b>
-Свяжитесь с @{CHANNEL_USERNAME} для оформления покупки.
+<b>📝 Способ оплаты:</b>
+Свяжитесь с @{CHANNEL_USERNAME} для оформления.
 
 Передайте администратору:
-• Ваш ID: <code>{user_id}</code>
-• Тариф: {tariff_info['name']}
-• Цена: {tariff_info['price']} руб
+• <b>Ваш ID:</b> <code>{user_id}</code>
+• <b>Тариф:</b> {tariff_info['name']}
+• <b>Цена:</b> {tariff_info['price']} руб
         """
         
         TelegramAPI.edit_message(
@@ -493,40 +768,88 @@ def handle_callback_query(callback_query: dict):
     # ========== ПРОФИЛЬ ==========
     
     elif callback_data == "profile":
-        user = get_or_create_user(user_id)
         profile_text = get_user_profile_text(user_id)
         
         TelegramAPI.edit_message(
             chat_id, message_id,
             profile_text,
-            reply_markup={"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "back_main"}]]}
+            reply_markup=get_profile_keyboard()
         )
     
-    # ========== СВЕЖИЕ VPN ==========
-    
-    elif callback_data == "latest_vpn":
-        vpn_links = db.fetch_all(
-            "SELECT * FROM vpn_links WHERE is_active = 1 ORDER BY added_date DESC LIMIT 5"
-        )
+    elif callback_data == "referral_system":
+        user = db.fetch_one("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        referral_count = db.fetch_one(
+            "SELECT COUNT(*) as count FROM referrals WHERE referrer_id = ?",
+            (user_id,)
+        )['count']
         
-        if not vpn_links:
-            latest_text = "❌ Свежих VPN нет. Следите за обновлениями!"
-        else:
-            latest_text = "<b>📥 5 Последних VPN:</b>\n\n"
-            for i, vpn in enumerate(vpn_links, 1):
-                added = datetime.fromisoformat(vpn['added_date']).strftime('%d.%m %H:%M')
-                latest_text += f"{i}. <code>{vpn['link']}</code>\n   📅 {added}\n\n"
+        referral_link = f"https://t.me/{BOT_NAME}?start={user['referral_code']}"
+        
+        ref_text = f"""
+<b>🔗 Реферальная система</b>
+
+<b>Как это работает:</b>
+1. Поделитесь вашей ссылкой с друзьями
+2. Когда друг присоединяется - у вас минус 1 день кулдауна!
+3. Чем больше рефералов, тем чаще получаете VPN
+
+<b>📊 Ваша статистика:</b>
+• Приглашено: <b>{referral_count}</b> чел.
+• Сэкономлено: <b>{referral_count}</b> дней
+
+<b>🔗 Ваша реферальная ссылка:</b>
+<code>{referral_link}</code>
+        """
         
         TelegramAPI.edit_message(
             chat_id, message_id,
-            latest_text,
+            ref_text.strip(),
+            reply_markup={"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "profile"}]]}
+        )
+    
+    elif callback_data == "enter_promo":
+        promo_text = """
+<b>🎁 Введите промокод</b>
+
+Отправьте промокод следующим сообщением.
+
+<b>Что даёт промокод:</b>
+✅ Обнуление кулдауна
+✅ Возможность получить VPN сразу
+        """
+        
+        TelegramAPI.send_message(
+            user_id,
+            promo_text.strip(),
+            reply_markup={"force_reply": True}
+        )
+    
+    # ========== СТАТИСТИКА ==========
+    
+    elif callback_data == "statistics":
+        stats_text = get_statistics_text()
+        
+        TelegramAPI.edit_message(
+            chat_id, message_id,
+            stats_text,
             reply_markup={"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "back_main"}]]}
         )
     
-    # ========== АДМИНИСТРАТОР ==========
+    # ========== ТОП РЕФЕРАЛОВ ==========
+    
+    elif callback_data == "top_referrals":
+        top_text = get_top_referrals_text()
+        
+        TelegramAPI.edit_message(
+            chat_id, message_id,
+            top_text,
+            reply_markup={"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "back_main"}]]}
+        )
+    
+    # ========== АДМИН-ПАНЕЛЬ ==========
     
     elif callback_data == "admin" and is_admin:
-        admin_text = "<b>⚙️ Администраторская панель</b>"
+        admin_text = "<b>⚙️ Администраторская панель</b>\n\nВыберите действие:"
         TelegramAPI.edit_message(
             chat_id, message_id,
             admin_text,
@@ -543,7 +866,7 @@ def handle_callback_query(callback_query: dict):
 Ссылка 2
 Ссылка 3</code>
 
-Либо отправьте одну ссылку в сообщении.
+Либо одну ссылку в сообщении.
         """
         
         TelegramAPI.send_message(
@@ -562,13 +885,28 @@ def handle_callback_query(callback_query: dict):
         else:
             list_text = f"<b>📋 VPN Ссылки ({len(vpn_links)})</b>\n\n"
             for i, vpn in enumerate(vpn_links, 1):
-                list_text += f"{i}. <code>{vpn['link']}</code>\n   Выдано: {vpn['given_count']} | ID: {vpn['id']}\n\n"
+                list_text += f"{i}. <code>{vpn['link'][:50]}...</code>\n   Выдано: {vpn['given_count']} раз\n\n"
         
         TelegramAPI.edit_message(
             chat_id, message_id,
             list_text,
             reply_markup={"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "admin"}]]}
         )
+    
+    elif callback_data == "admin_promo" and is_admin:
+        promo_text = """
+<b>🎁 Управление промокодами</b>
+
+Доступные команды:
+
+/create_promo <кол-во> [лимит]
+
+Пример:
+/create_promo 10 - создать 10 одноразовых
+/create_promo 5 100 - создать 5 на 100 активаций
+        """
+        
+        TelegramAPI.send_message(user_id, promo_text.strip())
     
     elif callback_data == "admin_stats" and is_admin:
         total_users = db.fetch_one("SELECT COUNT(*) as count FROM users")['count']
@@ -578,7 +916,7 @@ def handle_callback_query(callback_query: dict):
         )['count']
         
         stats_text = f"""
-<b>📊 Статистика бота</b>
+<b>📊 Админ статистика</b>
 
 <b>👥 Пользователи:</b>
 • Всего: {total_users}
@@ -616,7 +954,7 @@ def handle_text_message(message: dict):
     text = message.get('text', '')
     is_admin = user_id == ADMIN_ID
     
-    # Проверка на команды администратора
+    # Команды админа
     if text.startswith('/') and is_admin:
         command_parts = text.split()
         command = command_parts[0].lower()
@@ -629,8 +967,37 @@ def handle_text_message(message: dict):
                 'id': str(random.randint(1000000, 9999999))
             })
             return
+        
+        elif command == '/create_promo':
+            if len(command_parts) < 2:
+                TelegramAPI.send_message(
+                    user_id,
+                    "❌ Использование: /create_promo <кол-во> [лимит]"
+                )
+                return
+            
+            try:
+                count = int(command_parts[1])
+                limit = int(command_parts[2]) if len(command_parts) > 2 else 1
+                
+                codes = create_promo_codes(count, limit)
+                
+                codes_text = f"✅ <b>Создано {count} промокодов!</b>\n\n"
+                codes_text += "Первые 10:\n"
+                for i, code in enumerate(codes[:10], 1):
+                    codes_text += f"{i}. <code>{code}</code>\n"
+                if count > 10:
+                    codes_text += f"\n... и ещё {count-10} кодов"
+                
+                TelegramAPI.send_message(user_id, codes_text)
+            except ValueError:
+                TelegramAPI.send_message(
+                    user_id,
+                    "❌ Количество должно быть числом!"
+                )
+            return
     
-    # Проверка на ответ администратора (загрузка VPN или рассылка)
+    # Проверка на ответ админа
     if message.get('reply_to_message') and is_admin:
         reply_text = message.get('reply_to_message', {}).get('text', '')
         
@@ -642,7 +1009,6 @@ def handle_text_message(message: dict):
             for line in lines:
                 line = line.strip()
                 if line and (line.startswith('http://') or line.startswith('https://')):
-                    # Проверка что ссылка уже не в БД
                     existing = db.fetch_one(
                         "SELECT * FROM vpn_links WHERE link = ?",
                         (line,)
@@ -650,8 +1016,8 @@ def handle_text_message(message: dict):
                     
                     if not existing:
                         db.execute(
-                            "INSERT INTO vpn_links (link, expiry_date) VALUES (?, ?)",
-                            (line, (datetime.now() + timedelta(days=90)).isoformat())
+                            "INSERT INTO vpn_links (link) VALUES (?)",
+                            (line,)
                         )
                         count += 1
             
@@ -665,8 +1031,8 @@ def handle_text_message(message: dict):
             
             TelegramAPI.send_message(user_id, response_text.strip())
             
-            # Отправка уведомлений пользователям
-            users = db.fetch_all("SELECT user_id, notifications_enabled FROM users WHERE notifications_enabled = 1")
+            # Уведомления
+            users = db.fetch_all("SELECT user_id FROM users WHERE notifications_enabled = 1")
             
             notify_text = f"""
 🎉 <b>НОВЫЕ VPN ЗАГРУЖЕНЫ!</b>
@@ -681,7 +1047,7 @@ def handle_text_message(message: dict):
                     TelegramAPI.send_message(
                         user['user_id'],
                         notify_text.strip(),
-                        reply_markup=get_main_keyboard()
+                        reply_markup=get_main_keyboard(user['user_id'] == ADMIN_ID)
                     )
                     time.sleep(0.05)
                 except:
@@ -699,7 +1065,7 @@ def handle_text_message(message: dict):
                     TelegramAPI.send_message(
                         user['user_id'],
                         text,
-                        reply_markup=get_main_keyboard()
+                        reply_markup=get_main_keyboard(user['user_id'] == ADMIN_ID)
                     )
                     sent_count += 1
                     time.sleep(0.05)
@@ -714,6 +1080,14 @@ def handle_text_message(message: dict):
             
             TelegramAPI.send_message(user_id, response_text.strip())
             return
+    
+    # Проверка на промокод
+    if message.get('reply_to_message'):
+        reply_text = message.get('reply_to_message', {}).get('text', '')
+        if 'промокод' in reply_text.lower():
+            success, msg = use_promo_code(user_id, text.strip())
+            TelegramAPI.send_message(user_id, msg)
+            return
 
 # ============================================================================
 # ГЛАВНАЯ ПРОГРАММА
@@ -724,7 +1098,6 @@ def process_update(update: dict):
         message = update['message']
         user_id = message['from']['id']
         
-        # Обновить статус онлайна
         db.execute(
             "UPDATE users SET is_online = 1, last_activity = ? WHERE user_id = ?",
             (datetime.now().isoformat(), user_id)
@@ -740,7 +1113,6 @@ def process_update(update: dict):
         callback_query = update['callback_query']
         user_id = callback_query['from']['id']
         
-        # Обновить статус онлайна
         db.execute(
             "UPDATE users SET is_online = 1, last_activity = ? WHERE user_id = ?",
             (datetime.now().isoformat(), user_id)
@@ -768,10 +1140,6 @@ def get_updates(timeout: int = 30):
         except Exception as e:
             print(f"Ошибка: {e}")
             time.sleep(5)
-
-# ============================================================================
-# ЗАПУСК
-# ============================================================================
 
 if __name__ == "__main__":
     print(f"✅ Бот {BOT_NAME} запущен!")
